@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         物理实验系统自动答题 Agent (DeepSeek 专属单体版)
 // @namespace    http://tampermonkey.net/
-// @version      3.0.DS
+// @version      3.0.1.DS
 // @description  专门针对 DeepSeek 接口标准优化的批处理自动化架构
 // @author       Frank
 // @match        *://openlab.hitwh.edu.cn/dxwl/*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_registerMenuCommand
 // @connect      api.deepseek.com
 // ==/UserScript==
 
@@ -19,7 +20,9 @@
         ],
         MODEL: "deepseek-chat", // 严谨约束为 DeepSeek 标准对话模型
         URL: "https://api.deepseek.com/chat/completions",
-        DELAY_MS: 3000
+        DELAY_MS: 3000,
+        LOAD_TIMEOUT_MS: 20000, // 题目及页面切换最多等待 20 秒，可按网络情况调整
+        MAX_RETRIES: 4
     };
 
     let currentKeyIndex = 0;
@@ -30,10 +33,72 @@
         return !!(elem && elem.offsetWidth > 0 && elem.offsetHeight > 0 && elem.offsetParent !== null);
     }
 
+
+    const SKIP_KEY = "LSM_SKIPPED_EXPERIMENTS";
+    let skippedExperiments;
+    try {
+        skippedExperiments = new Set(JSON.parse(sessionStorage.getItem(SKIP_KEY) || "[]"));
+    } catch (_) {
+        skippedExperiments = new Set();
+    }
+    let currentExperiment = null;
+    let openingSince = 0;
+
+    function getExperiment(row) {
+        const name = row.querySelector("span[style*='font-weight: bold']")?.innerText.trim()
+            || row.innerText.split("\n")[0].trim();
+        return { id: row.getAttribute("data-row-key") || name, name };
+    }
+
+    // 捕获手动和自动点击，避免沿用上一个实验名称。
+    document.addEventListener("click", event => {
+        const row = event.target.closest?.("tr.ant-table-row");
+        if (row && isVisible(row) && row.innerText.includes("未通过") && row.innerText.includes("可考试")) {
+            currentExperiment = getExperiment(row);
+            openingSince = Date.now();
+        }
+    }, true);
+
+    GM_registerMenuCommand("重新尝试已跳过实验", () => {
+        sessionStorage.removeItem(SKIP_KEY);
+        location.reload();
+    });
+
+    function skipExperiment(experiment, reason) {
+        if (experiment) {
+            skippedExperiments.add(experiment.id);
+            sessionStorage.setItem(SKIP_KEY, JSON.stringify([...skippedExperiments]));
+        }
+        console.warn(`暂时跳过【${experiment?.name || "未确认的实验"}】：${reason}。可从脚本菜单重新尝试。`);
+        location.reload();
+    }
+
+    async function waitFor(test) {
+        const deadline = Date.now() + CONFIG.LOAD_TIMEOUT_MS;
+        while (!test()) {
+            if (Date.now() >= deadline) return false;
+            await sleep(500);
+        }
+        return true;
+    }
+
+    async function waitForQuestions(samePaper) {
+        let cards = [];
+        const ready = await waitFor(() => {
+            cards = Array.from(document.querySelectorAll(".ant-card-bordered"))
+                .filter(card => isVisible(card) && card.innerText.includes("试题:"));
+            const loading = Array.from(document.querySelectorAll(".full-loading, .ant-spin-spinning")).some(isVisible);
+            return !samePaper() || (!loading && cards.length > 0 && cards.every(card =>
+                card.querySelector("div[style='padding: 12px;'] > div:nth-child(2)")?.innerText.trim()
+                && card.querySelector(".exam-radio input[type='radio']")));
+        });
+        return ready ? cards : [];
+    }
+
     // 决策模块：硬编码适配 DeepSeek (OpenAI 协议) 规范
     function getBatchDecisionFromAPI(expName, paperText, questionCount) {
         return new Promise((resolve, reject) => {
-            const prompt = `你是一个严谨的物理学专家。当前正在解答的大学物理实验预考核项目是：【${expName}】。
+            const prompt = `你是一个严谨的物理学专家。${expName ? `当前实验是：【${expName}】。` : "实验名称未确认，请以题干和选项为准。"}
 请结合该实验的物理原理连贯作答。
 要求条件：
 1. 大学物理题需要严谨的推导。请针对每一道题，简要写出你的物理公式与思考计算过程。
@@ -95,10 +160,11 @@ ${paperText}`;
                         }
 
                         const answerArray = JSON.parse(jsonMatch[1]);
-                        if (Array.isArray(answerArray) && answerArray.length === questionCount) {
+                        if (Array.isArray(answerArray) && answerArray.length === questionCount
+                            && answerArray.every(answer => typeof answer === "string" && /^[A-Z]$/.test(answer))) {
                             resolve(answerArray);
                         } else {
-                            console.error(`数组长度异常: 期望 ${questionCount}，实际返回 ${answerArray.length}`);
+                            console.error(`答案数组无效：期望 ${questionCount} 个选项字母。`);
                             reject("LENGTH_MISMATCH");
                         }
                     } catch (e) {
@@ -115,142 +181,107 @@ ${paperText}`;
         });
     }
 
-    // 主调度状态机
+    // 主调度：空题暂时跳过，API 或提交失败时暂停，避免空卷与无限重试。
     async function runAgent() {
-        console.log(`Agent (DeepSeek 单体版) 启动，挂载并发秘钥数：${CONFIG.API_KEYS.length}`);
-
+        console.log("Agent (DeepSeek) 启动。");
         while (true) {
             await sleep(CONFIG.DELAY_MS);
-
             const buttons = Array.from(document.querySelectorAll("button"));
             const submitBtn = buttons.find(b => b.innerText.includes("提交答案") && isVisible(b));
-            const returnBtn = buttons.find(b => b.innerText.includes("返 回") && isVisible(b));
+            const returnBtn = buttons.find(b => b.innerText.replace(/\s/g, "") === "返回" && isVisible(b));
 
-            // 状态一：预考核试卷装载状态
             if (submitBtn) {
-                console.log("状态判定：【预考核答题页】，启动 DOM 树遍历与结构化重组...");
-                const cards = document.querySelectorAll(".ant-card-bordered");
-                const currentExpName = sessionStorage.getItem("LSM_EXP_NAME") || "未知物理实验";
+                openingSince = 0;
+                const experiment = currentExperiment;
+                const samePaper = () => currentExperiment === experiment && isVisible(submitBtn);
+                const cards = await waitForQuestions(samePaper);
+                if (!samePaper()) continue;
+                if (!cards.length) {
+                    skipExperiment(experiment, "等待题目超时，可能尚未发布或加载失败");
+                    return;
+                }
 
                 let paperText = "";
-                let allTargetNodes = [];
-                let validQuestionCount = 0;
-
-                for (let card of cards) {
-                    if (!card.innerText.includes("试题:")) continue;
-                    validQuestionCount++;
-
-                    const titleNode = card.querySelector("div[style='padding: 12px;'] > div:nth-child(2)");
-                    const titleText = titleNode ? titleNode.innerText.trim() : "";
-
-                    paperText += `\n第 ${validQuestionCount} 题：${titleText}\n`;
-
-                    const radioBlocks = card.querySelectorAll(".exam-radio");
-                    let currentQuestionNodes = [];
-
-                    radioBlocks.forEach((block, index) => {
-                        const letter = String.fromCharCode(65 + index);
-                        const optTextNode = block.querySelector(".ant-col-22");
-                        const optText = optTextNode ? optTextNode.innerText.trim() : "";
-                        paperText += `${letter}. ${optText}\n`;
-
-                        currentQuestionNodes.push(block.querySelector("input[type='radio']"));
+                const allTargetNodes = [];
+                for (const [index, card] of cards.entries()) {
+                    const title = card.querySelector("div[style='padding: 12px;'] > div:nth-child(2)").innerText.trim();
+                    paperText += `\n第 ${index + 1} 题：${title}\n`;
+                    const nodes = [];
+                    card.querySelectorAll(".exam-radio").forEach((block, optionIndex) => {
+                        const text = block.querySelector(".ant-col-22")?.innerText.trim() || "";
+                        paperText += `${String.fromCharCode(65 + optionIndex)}. ${text}\n`;
+                        nodes.push(block.querySelector("input[type='radio']"));
                     });
-                    allTargetNodes.push(currentQuestionNodes);
+                    allTargetNodes.push(nodes);
                 }
 
-                if (validQuestionCount > 0) {
-                    console.log(`载入语境【${currentExpName}】。试卷共 ${validQuestionCount} 题。向 DeepSeek 发起批处理请求...`);
-
-                    let paperSolved = false;
-                    let exhaustedKeysCount = 0;
-                    let maxRetries = 4;
-
-                    while (!paperSolved && maxRetries > 0) {
-                        await sleep(2500);
-
-                        try {
-                            const answerArray = await getBatchDecisionFromAPI(currentExpName, paperText, validQuestionCount);
-                            console.log("DeepSeek 返回决策矩阵:", answerArray);
-
-                            for (let i = 0; i < answerArray.length; i++) {
-                                const ansLetter = answerArray[i];
-                                const ansIndex = ansLetter.charCodeAt(0) - 65;
-                                const nodes = allTargetNodes[i];
-
-                                if (nodes && nodes[ansIndex]) {
-                                    nodes[ansIndex].click();
-                                }
-                            }
-
-                            paperSolved = true;
-                            console.log("DOM 节点物理映射完毕，准备触发表单提交...");
-                            await sleep(1500);
-
-                        } catch (err) {
-                            if (err === "KEY_EXHAUSTED") {
-                                exhaustedKeysCount++;
-                                currentKeyIndex = (currentKeyIndex + 1) % CONFIG.API_KEYS.length;
-                                console.warn(`当前 API Key 触发 429 熔断，状态机自动轮询至索引 [${currentKeyIndex}]...`);
-
-                                if (exhaustedKeysCount >= CONFIG.API_KEYS.length) {
-                                    console.warn(`所有挂载的 DeepSeek Key 并发耗尽，系统挂起 60 秒执行退避策略...`);
-                                    await sleep(60000);
-                                    exhaustedKeysCount = 0;
-                                }
-                            } else if (err === "INSUFFICIENT_BALANCE") {
-                                console.error("检测到 402 余额耗尽，物理终止当前试卷请求过程。");
-                                break; // 强制跳出请求循环，提交空卷防止死锁
-                            } else {
-                                maxRetries--;
-                                console.error(`批处理解析抛出硬性异常 (${err})。当前试卷剩余重试配额: ${maxRetries}`);
-                                await sleep(3000);
-                            }
+                let paperSolved = false;
+                for (let attempt = 0; attempt < CONFIG.MAX_RETRIES && samePaper(); attempt++) {
+                    try {
+                        const answers = await getBatchDecisionFromAPI(experiment?.name || "", paperText, cards.length);
+                        if (!samePaper()) break;
+                        const targets = answers.map((answer, index) =>
+                            allTargetNodes[index][answer.charCodeAt(0) - 65]);
+                        if (targets.some(node => !node)) throw new Error("INVALID_ANSWER");
+                        targets.forEach(node => node.click());
+                        paperSolved = true;
+                        break;
+                    } catch (err) {
+                        if (!samePaper()) break;
+                        if (err === "INSUFFICIENT_BALANCE") {
+                            console.error("余额不足，脚本已暂停；未提交试卷。");
+                            return;
+                        }
+                        if (err === "KEY_EXHAUSTED") {
+                            currentKeyIndex = (currentKeyIndex + 1) % CONFIG.API_KEYS.length;
+                        }
+                        console.warn(`请求失败（${err}），剩余重试次数：${CONFIG.MAX_RETRIES - attempt - 1}`);
+                        if (attempt + 1 < CONFIG.MAX_RETRIES) {
+                            await sleep(err === "KEY_EXHAUSTED" ? 60000 : 3000);
                         }
                     }
-
-                    if (!paperSolved) {
-                        console.error("超出容错重试上限或资金耗尽，系统执行防御性空卷提交以打破阻塞。");
-                    }
                 }
-
+                if (!samePaper()) continue;
+                if (!paperSolved) {
+                    console.error("达到重试上限，脚本已暂停；未提交试卷。");
+                    return;
+                }
+                await sleep(1500);
+                if (!samePaper()) continue;
+                if (!allTargetNodes.every(nodes => nodes.some(node => node?.checked))) {
+                    console.error("仍有未选答案，脚本已暂停；未提交试卷。");
+                    return;
+                }
                 submitBtn.click();
-                await sleep(CONFIG.DELAY_MS);
+                if (!await waitFor(() => !samePaper())) {
+                    console.error("提交后仍停留在答题页，请检查平台提示；脚本已暂停。");
+                    return;
+                }
                 continue;
             }
 
-            // 状态二：考核成绩回传状态
-            if (returnBtn && !submitBtn) {
-                console.log("状态判定：【结果确认页】，回收页面并执行内存重载...");
+            if (returnBtn) {
                 returnBtn.click();
                 await sleep(CONFIG.DELAY_MS);
                 location.reload();
-                await sleep(CONFIG.DELAY_MS * 2);
+                return;
+            }
+
+            if (openingSince) {
+                if (Date.now() - openingSince >= CONFIG.LOAD_TIMEOUT_MS) {
+                    skipExperiment(currentExperiment, "未能进入答题页");
+                    return;
+                }
                 continue;
             }
 
-            // 状态三：实验项目聚合列表状态
-            const rows = document.querySelectorAll("tr.ant-table-row");
-            let clicked = false;
-
-            for (let row of rows) {
+            for (const row of document.querySelectorAll("tr.ant-table-row")) {
                 const text = row.innerText;
-
-                if (text.includes("下次准考时间")) {
-                    continue;
-                }
-
-                if (text.includes("未通过") && text.includes("可考试") && isVisible(row)) {
-                    const nameSpanNode = row.querySelector("span[style*='font-weight: bold']");
-                    const expName = nameSpanNode ? nameSpanNode.innerText.trim() : text.split('\n')[0];
-                    sessionStorage.setItem("LSM_EXP_NAME", expName);
-
-                    console.log(`感知目标项目：【${expName}】，激活流转动作。`);
-                    row.click();
-                    clicked = true;
-                    await sleep(CONFIG.DELAY_MS);
-                    break;
-                }
+                if (!isVisible(row) || text.includes("下次准考时间")
+                    || !text.includes("未通过") || !text.includes("可考试")) continue;
+                if (skippedExperiments.has(getExperiment(row).id)) continue;
+                row.click();
+                break;
             }
         }
     }
