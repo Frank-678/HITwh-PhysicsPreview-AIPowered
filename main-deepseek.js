@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         物理实验系统自动答题 Agent (DeepSeek 专属单体版)
 // @namespace    http://tampermonkey.net/
-// @version      3.0.1.DS
+// @version      3.0.2.DS
 // @description  专门针对 DeepSeek 接口标准优化的批处理自动化架构
 // @author       Frank
 // @match        *://openlab.hitwh.edu.cn/dxwl/*
@@ -181,7 +181,7 @@ ${paperText}`;
         });
     }
 
-    // 主调度：空题暂时跳过，API 或提交失败时暂停，避免空卷与无限重试。
+    // 主调度：空题暂时跳过，失败实验回目录后继续，避免空卷与无限重试。
     async function runAgent() {
         console.log("Agent (DeepSeek) 启动。");
         while (true) {
@@ -243,18 +243,18 @@ ${paperText}`;
                 }
                 if (!samePaper()) continue;
                 if (!paperSolved) {
-                    console.error("达到重试上限，脚本已暂停；未提交试卷。");
+                    skipExperiment(experiment, "达到 API 尝试上限，未提交试卷");
                     return;
                 }
                 await sleep(1500);
                 if (!samePaper()) continue;
                 if (!allTargetNodes.every(nodes => nodes.some(node => node?.checked))) {
-                    console.error("仍有未选答案，脚本已暂停；未提交试卷。");
+                    skipExperiment(experiment, "仍有未选答案，未提交试卷");
                     return;
                 }
                 submitBtn.click();
                 if (!await waitFor(() => !samePaper())) {
-                    console.error("提交后仍停留在答题页，请检查平台提示；脚本已暂停。");
+                    skipExperiment(experiment, "提交后仍停留在答题页，请检查平台提示");
                     return;
                 }
                 continue;

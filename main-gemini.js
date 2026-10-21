@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         物理实验系统自动答题 Agent
 // @namespace    http://tampermonkey.net/
-// @version      2.1.1
+// @version      2.1.2
 // @description  基于真实 DOM 结构的自动化考试执行脚本
 // @author       Frank
 // @match        http://openlab.hitwh.edu.cn/dxwl/*
@@ -142,7 +142,7 @@ const CONFIG = {
         });
     }
 
-    // 主调度：空题暂时跳过，失败时暂停，避免提交不完整试卷。
+    // 主调度：空题与失败实验暂时跳过，避免提交不完整试卷。
     async function runAgent() {
         console.log("Agent (Gemini) 启动。");
         agentLoop: while (true) {
@@ -190,18 +190,18 @@ const CONFIG = {
                     }
                     if (!samePaper()) continue agentLoop;
                     if (!solved) {
-                        console.error("达到重试上限，脚本已暂停；未提交试卷。");
+                        skipExperiment(experiment, "达到 API 尝试上限，未提交试卷");
                         return;
                     }
                 }
                 if (!samePaper()) continue;
                 if (!cards.every(card => card.querySelector("input[type='radio']:checked"))) {
-                    console.error("仍有未选答案，脚本已暂停；未提交试卷。");
+                    skipExperiment(experiment, "仍有未选答案，未提交试卷");
                     return;
                 }
                 submitBtn.click();
                 if (!await waitFor(() => !samePaper())) {
-                    console.error("提交后仍停留在答题页，请检查平台提示；脚本已暂停。");
+                    skipExperiment(experiment, "提交后仍停留在答题页，请检查平台提示");
                     return;
                 }
                 continue;
