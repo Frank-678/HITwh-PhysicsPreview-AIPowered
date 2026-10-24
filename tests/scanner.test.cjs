@@ -13,19 +13,28 @@ async function scenario(options = {}) {
     getClientRects: () => shown() ? [{}] : [], blur() {}, remove() {},
     getAttribute() { return null; }, querySelector() { return null; }, querySelectorAll() { return []; }
   });
-  const fields = Object.fromEntries(['.start', '.stop', '.csv', '.stats', '.log', 'tbody'].map(key => [key, element()]));
+  const fields = Object.fromEntries(['.start', '.stop', '.csv', '.diagnostic', '.stats', '.log', 'tbody'].map(key => [key, element()]));
   const panel = { ...element(), querySelector: key => fields[key] };
   const courses = ['实验 "甲"<测试>', '实验乙'];
-  const dateValues = ['2026-10-20', '2026-10-21', '2026-10-22', '2027-01-30'];
+  const dateValues = options.invalidDates ? ['十月二十一日'] : options.pastDates ? ['2026-09-01']
+    : ['2026-10-20', '2026-10-21', '2026-10-22', '2027-01-30'];
+  const displayDate = date => options.dateStyle === 'slash' ? date.replace(/-/g, '/')
+    : options.dateStyle === 'chinese' ? date.replace(/-(\d+)-(\d+)/, (_, m, d) => '年' + Number(m) + '月' + Number(d) + '日')
+    : options.dateStyle === 'timestamp' ? date + ' 00:00:00' : date;
   const areas = Object.fromEntries(['COURSES', 'DATES', 'TIMES'].map(name => [name, element('', () => state.stage === name)]));
-  const cell = value => ({ ...element(value), getAttribute: name => name === 'title' ? value : null });
+  const cell = value => ({ ...element(value), getAttribute: name => name === 'title'
+    ? options.badDateTitle && /^\d{4}/.test(value) ? '查看日期详情' : value : null });
   const row = (cells, handler) => ({ ...element(), querySelector: () => cell(cells[0]),
     querySelectorAll: () => cells.map(cell), click: handler });
-  areas.COURSES.querySelectorAll = selector => selector === 'tr.ant-table-row' ? courses.map(name =>
-    row([name], () => { state.course = name; state.stage = 'DATES'; })) : [];
+  areas.COURSES.querySelectorAll = selector => selector === '.ant-empty' && options.emptyCourses ? [element()]
+    : selector === 'tr.ant-table-row' && !options.emptyCourses ? courses.map(name =>
+      row([name], () => { state.course = name; state.stage = 'DATES'; state.dateReadyAt = now + (options.dateDelay || 0); })) : [];
   const back = { ...element('返 回'), click() { state.stage = 'COURSES'; } };
-  areas.DATES.querySelectorAll = selector => selector === 'button' ? [back] : selector === 'tr.ant-table-row'
-    ? (options.emptyDates ? [] : dateValues).map(date => row([date, '8', '星期三'], () => { state.date = date; state.stage = 'TIMES'; })) : [];
+  areas.DATES.querySelectorAll = selector => selector === 'button' ? [back]
+    : selector === '.ant-empty' && options.emptyDates ? [element()]
+    : selector === 'tr.ant-table-row' && !options.emptyDates && now >= (state.dateReadyAt || 0)
+      ? dateValues.map(date => row([...(options.checkbox ? [''] : []), displayDate(date), '8', '星期三'],
+        () => { state.date = date; state.stage = 'TIMES'; })) : [];
   const radios = ['第一大节', '第二大节'].map((period, index) => {
     const input = { ...element(), click() { state.period = period; } };
     return { ...element(period + '\n开始时间：' + (index ? '10:00' : '08:00')), querySelector: () => input };
@@ -65,24 +74,27 @@ async function scenario(options = {}) {
   Object.defineProperty(areas.TIMES, 'innerText', { get: () => '实验室名称：N"<实验室>\n' + state.seats.map(s => s.innerText).join('\n') });
   const names = ['请在下面选择实验项目', '选择预约实验的日期和节次', '可选上课时间'];
   const headings = names.map((name, i) => ({ ...element(name), closest: () => ({ parentElement: areas[['COURSES', 'DATES', 'TIMES'][i]] }) }));
-  const root = { querySelectorAll: () => headings };
-  let mounted = false;
+  if (options.duplicateSection) headings.unshift({ ...element(names[1]), closest: () => ({ parentElement: element('', () => false) }) });
+  const root = { ...element(), querySelectorAll: () => headings };
+  let mounted = !!options.existingPanel;
   const document = {
     activeElement: element(), body: { appendChild(el) { if (el === panel) mounted = true; } },
     getElementById: () => mounted ? panel : null,
     querySelector: selector => selector === '.vctch-layout-content.full' ? root : null,
-    querySelectorAll: () => [element('', () => loading)],
+    querySelectorAll: selector => selector === '.vctch-layout-content.full'
+      ? [...(options.hiddenRoot ? [element('', () => false)] : []), root] : [element('', () => loading)],
     createElement(tag) {
       if (tag === 'div') return panel;
       return { ...element(), click() { downloads.push(blobs.get(this.href)); } };
     }
   };
-  const context = { document, window, XMLHttpRequest: XHR, Blob, console: { log(...v) { logs.push(v.join(' ')); }, warn() {}, error() {} },
+  const context = { document, window, XMLHttpRequest: XHR, Blob, console: { log(...v) { logs.push(v.join(' ')); }, warn(...v) { logs.push(v.join(' ')); }, error() {} },
     alert: message => logs.push(message), getComputedStyle: () => ({ visibility: 'visible' }),
     setTimeout: schedule, URL: { createObjectURL(blob) { const key = 'blob:' + blobs.size; blobs.set(key, blob); return key; }, revokeObjectURL() {} },
     Date: class extends Date { constructor(...args) { super(...(args.length ? args : [now])); } static now() { return now; } }
   };
   vm.runInNewContext(code, context);
+  if (options.existingPanel) return { status: fields['.log'].textContent, logs, queries: state.queries };
   let done = false;
   const promise = fields['.start'].onclick().then(() => { done = true; });
   if (options.stopAt) schedule(() => { fields['.stop'].onclick(); fields['.start'].onclick(); }, options.stopAt);
@@ -103,7 +115,9 @@ async function scenario(options = {}) {
   assert.equal(fields['.stop'].disabled, true);
   fields['.csv'].onclick();
   const csv = await downloads[0].text();
-  return { state, csv, rows: fields.tbody.innerHTML, status: fields['.log'].textContent, logs };
+  fields['.diagnostic'].onclick();
+  const diagnostic = JSON.parse(await downloads[1].text());
+  return { state, csv, diagnostic, rows: fields.tbody.innerHTML, status: fields['.log'].textContent, logs };
 }
 
 (async () => {
@@ -116,7 +130,18 @@ async function scenario(options = {}) {
     ['zero seats retained', { full: true }, 8],
     ['no dates', { emptyDates: true }, 0],
     ['stop preserves partial results', { delay: 12000, stopAt: 15000 }, 1],
-    ['wrong starting page', { wrongStage: true }, 0]
+    ['wrong starting page', { wrongStage: true }, 0],
+    ['date rows arrive after the page becomes visible', { dateDelay: 12000 }, 8],
+    ['slash dates', { dateStyle: 'slash' }, 8],
+    ['Chinese dates', { dateStyle: 'chinese' }, 8],
+    ['timestamp date cells', { dateStyle: 'timestamp' }, 8],
+    ['date text overrides non-date tooltip', { badDateTitle: true }, 8],
+    ['checkbox before date column', { checkbox: true }, 8],
+    ['unrecognized dates reported', { invalidDates: true }, 0],
+    ['past dates explained', { pastDates: true }, 0],
+    ['visible content root selected', { hiddenRoot: true }, 8],
+    ['visible date section preferred', { duplicateSection: true }, 8],
+    ['missing course names reported', { emptyCourses: true }, 0]
   ];
   for (const [name, options, expected] of cases) {
     const r = await scenario(options);
@@ -129,6 +154,16 @@ async function scenario(options = {}) {
     }
     if (options.full) assert.ok(r.csv.includes('"0","3"'), 'zero capacity retained');
     if (options.stopAt) assert.equal(r.state.queries, 2, 'restart blocked while stopping');
+    if (options.invalidDates) assert.ok(r.status.includes('无法识别日期列'), 'invalid dates must not look successful');
+    if (options.emptyCourses) assert.ok(r.status.includes('未识别到实验名称'), 'missing courses must not look successful');
+    if (options.pastDates) assert.ok(r.diagnostic.events.some(e => e.message.includes('天内 0 行')), 'filtered dates explained');
+    assert.equal(r.diagnostic.version, '2026-10-24.1');
+    assert.ok(r.diagnostic.computerTime && Array.isArray(r.diagnostic.dates));
     console.log('PASS scanner:', name);
   }
+  const existing = await scenario({ existingPanel: true });
+  assert.ok(existing.status.includes('刷新页面') && existing.logs.some(message => message.includes('2026-10-24.1')));
+  assert.equal(existing.queries, 0);
+  console.log('PASS scanner: duplicate injection visibly rejected; total', cases.length + 1, 'scenarios');
 })().catch(error => { console.error(error); process.exitCode = 1; });
+

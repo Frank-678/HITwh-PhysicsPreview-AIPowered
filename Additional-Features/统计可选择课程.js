@@ -2,22 +2,40 @@
   'use strict';
 
   const CONFIG = { DAYS_AHEAD: 100, TIMEOUT_MS: 20000, POLL_MS: 50 };
+  const VERSION = '2026-10-24.1';
   const PANEL_ID = 'hitwh-physics-fast-v6';
-  if (document.getElementById(PANEL_ID)) return;
+  const existing = document.getElementById(PANEL_ID);
+  if (existing) {
+    const message = '已有扫描器面板，请先刷新页面，再粘贴新版脚本（' + VERSION + '）。';
+    const status = existing.querySelector('.log');
+    if (status) status.textContent = message;
+    console.warn(message);
+    alert(message);
+    return;
+  }
 
   let running = false;
   let stopped = false;
   let pending = 0;
   let failures = 0;
+  let skipped = 0;
+  const events = [];
   const results = new Map();
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   const compact = value => String(value || '').replace(/\s+/g, '');
   const rawText = el => (el?.innerText || el?.textContent || '').trim();
   const visible = el => !!el && getComputedStyle(el).visibility !== 'hidden'
     && el.getClientRects().length > 0;
-  const root = () => document.querySelector('.vctch-layout-content.full') || document.body;
-  const section = label => [...root().querySelectorAll('.ant-divider-inner-text')]
-    .find(el => compact(rawText(el)) === label)?.closest('.ant-divider')?.parentElement;
+  const root = () => [...document.querySelectorAll('.vctch-layout-content.full')].find(visible) || document.body;
+  const knownSections = new Map();
+  function section(label) {
+    const matches = [...root().querySelectorAll('.ant-divider-inner-text')]
+      .filter(el => compact(rawText(el)) === label).map(el => el.closest('.ant-divider')?.parentElement);
+    const shown = matches.find(visible);
+    if (shown) knownSections.set(label, shown);
+    const remembered = knownSections.get(label);
+    return shown || (matches.includes(remembered) ? remembered : matches[0]);
+  }
   const coursesSection = () => section('请在下面选择实验项目');
   const datesSection = () => section('选择预约实验的日期和节次');
   const timesSection = () => section('可选上课时间');
@@ -53,7 +71,14 @@
   }
 
   async function waitStage(expected) {
+    await sleep(0);
     await waitFor(() => stage() === expected && !busy() && !pending, expected);
+    await sleep(0);
+  }
+
+  async function waitRows(getSection, label) {
+    await waitFor(() => rows(getSection()).length
+      || [...(getSection()?.querySelectorAll('.ant-empty') || [])].some(visible), label);
   }
 
   // 只在扫描期间观察请求，结束后恢复；查询失败时不把上一时段的数据当成新结果。
@@ -98,6 +123,7 @@
   async function enterCourse(name) {
     click(rows(coursesSection()).find(row => courseName(row) === name));
     await waitStage('DATES');
+    await waitRows(datesSection, '日期列表：' + name);
   }
 
   async function returnToCourses() {
@@ -107,9 +133,20 @@
     await waitStage('COURSES');
   }
 
+  function normalizeDate(value) {
+    const match = String(value || '').trim().match(/^(\d{4})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})(?:日|(?=[T\s]|$))/);
+    if (!match) return '';
+    const [year, month, day] = match.slice(1).map(Number);
+    const date = new Date(year, month - 1, day);
+    if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day) return '';
+    return [year, String(month).padStart(2, '0'), String(day).padStart(2, '0')].join('-');
+  }
+
   function dateInfo(row) {
-    const cells = row.querySelectorAll('td');
-    return { date: cellText(cells[0]), week: rawText(cells[1]), weekday: cellText(cells[2]) };
+    const cells = [...row.querySelectorAll('td')];
+    const dates = cells.map(cell => normalizeDate(cell.getAttribute('title')) || normalizeDate(rawText(cell)));
+    const index = dates.findIndex(Boolean);
+    return { date: dates[index] || '', week: rawText(cells[index + 1]), weekday: cellText(cells[index + 2]) };
   }
 
   function withinHorizon(date) {
@@ -162,17 +199,26 @@
     }
     running = true;
     stopped = false;
+    skipped = 0;
+    events.length = 0;
     results.clear();
     render();
     const restoreNetwork = trackNetwork();
     try {
+      await waitRows(coursesSection, '实验列表');
       const courses = rows(coursesSection()).map(courseName)
         .filter(name => name && !/^\d{4}-\d{2}-\d{2}$/.test(name));
+      if (!courses.length) throw new Error('未识别到实验名称，请导出诊断');
       for (const [index, course] of courses.entries()) {
         checkStopped();
         log(`[${index + 1}/${courses.length}] ${course}`);
         await enterCourse(course);
-        const dates = rows(datesSection()).map(dateInfo).filter(row => withinHorizon(row.date));
+        const dateRows = rows(datesSection());
+        const recognized = dateRows.map(dateInfo).filter(row => row.date);
+        if (dateRows.length && !recognized.length) throw new Error('无法识别日期列，请导出诊断：' + course);
+        const dates = recognized.filter(row => withinHorizon(row.date));
+        log(`${course}：日期 ${dateRows.length} 行，识别 ${recognized.length} 行，未来 ${CONFIG.DAYS_AHEAD} 天内 ${dates.length} 行`);
+        if (!dates.length) skipped++;
         await returnToCourses();
         for (const date of dates) {
           checkStopped();
@@ -190,22 +236,24 @@
                 render();
               } catch (error) {
                 if (stopped) throw error;
+                skipped++;
                 console.warn('[时段查询失败]', course, date.date, time.period, error);
                 log(`查询失败：${course} ${date.date} ${time.period}，已跳过`);
               }
             }
           } catch (error) {
             if (stopped) throw error;
+            skipped++;
             console.warn('[日期查询失败]', course, date.date, error);
             log(`日期查询失败：${course} ${date.date}，已跳过`);
           }
           await returnToCourses();
         }
       }
-      log(`完成：扫描 ${results.size} 个时段，其中 ${[...results.values()].filter(row => row.free > 0).length} 个有空位`);
+      log(`完成：扫描 ${results.size} 个时段，${[...results.values()].filter(row => row.free > 0).length} 个有空位，跳过/失败 ${skipped} 项`);
     } catch (error) {
       if (!stopped) console.error('[扫描中断]', error);
-      log(stopped ? `已停止，保留 ${results.size} 条结果` : '扫描中断：' + error.message);
+      log(stopped ? `已停止，保留 ${results.size} 条结果` : '扫描中断：' + error.message + '；可导出诊断');
     } finally {
       restoreNetwork();
       running = false;
@@ -219,13 +267,28 @@
       ...[...results.values()].map(row => fields.map(key => row[key]))];
     const csv = '\uFEFF' + data.map(row => row.map(value =>
       '"' + String(value ?? '').replace(/"/g, '""') + '"').join(',')).join('\n');
+    download('大物实验空余时段.csv', 'text/csv;charset=utf-8', csv);
+  }
+
+  function download(name, type, content) {
     const link = document.createElement('a');
-    link.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
-    link.download = '大物实验空余时段.csv';
+    link.href = URL.createObjectURL(new Blob([content], { type }));
+    link.download = name;
     document.body.appendChild(link);
     link.click();
     link.remove();
     setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  }
+
+  function exportDiagnostic() {
+    const preview = area => rows(area).slice(0, 5).map(row => [...row.querySelectorAll('td')]
+      .map(cell => ({ text: rawText(cell), title: cell.getAttribute('title') })));
+    const report = { version: VERSION, computerTime: new Date().toString(), stage: stage(),
+      pendingRequests: pending, resultCount: results.size, skipped,
+      courses: preview(coursesSection()), dates: preview(datesSection()),
+      headings: [...root().querySelectorAll('.ant-divider-inner-text')].map(el =>
+        ({ text: rawText(el), visible: visible(el) })), events };
+    download('大物实验扫描诊断.json', 'application/json;charset=utf-8', JSON.stringify(report, null, 2));
   }
 
   const esc = value => String(value ?? '').replace(/[&<>"']/g,
@@ -241,10 +304,12 @@
       <td>${esc(row.date)}<br><small>${esc(row.weekday)}</small></td>
       <td>${esc(row.period)}<br>${esc(row.start)}</td><td>${row.free}/${row.total}</td>
       <td>${esc(row.room || '-')}</td></tr>`).join('');
-    panel.querySelector('.stats').textContent = `结果 ${results.size} | 有空位 ${sorted.filter(row => row.free > 0).length}`;
+    panel.querySelector('.stats').textContent = `结果 ${results.size} | 有空位 ${sorted.filter(row => row.free > 0).length} | 跳过/失败 ${skipped}`;
   }
 
   function log(message) {
+    events.push({ time: new Date().toLocaleTimeString(), message });
+    if (events.length > 50) events.shift();
     console.log('[空余时段扫描器]', message);
     panel.querySelector('.log').textContent = message;
   }
@@ -266,14 +331,16 @@
       #${PANEL_ID} tr.free{background:#f3fff3}
       #${PANEL_ID} tr.full{opacity:.55}
     </style>
-    <div class="head"><b>大物实验空余时段扫描</b><span class="log">待机</span></div>
+    <div class="head"><b>空余时段扫描 ${VERSION}</b><span class="log">待机</span></div>
     <div class="actions"><button class="start">扫描未来 ${CONFIG.DAYS_AHEAD} 天</button>
-      <button class="stop">停止</button><button class="csv">导出 CSV</button><span class="stats"></span></div>
+      <button class="stop">停止</button><button class="csv">导出 CSV</button>
+      <button class="diagnostic">导出诊断</button><span class="stats"></span></div>
     <div class="body"><table><thead><tr><th>实验</th><th>日期</th><th>大节</th>
       <th>空闲/总数</th><th>实验室</th></tr></thead><tbody></tbody></table></div>`;
   document.body.appendChild(panel);
   panel.querySelector('.start').onclick = scanAll;
   panel.querySelector('.stop').onclick = () => { stopped = true; log('正在停止…'); render(); };
   panel.querySelector('.csv').onclick = exportCsv;
+  panel.querySelector('.diagnostic').onclick = exportDiagnostic;
   render();
 })();
