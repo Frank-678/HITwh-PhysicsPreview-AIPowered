@@ -1,1722 +1,346 @@
 (() => {
   'use strict';
 
-  const CONFIG = {
-    DAYS_AHEAD: 100,
-
-    // 只在确实需要时增长
-    MAX_DELAY: 32,
-
-    // 真正异常才会触发，不是正常等待
-    STAGE_TIMEOUT: 5000,
-    NETWORK_TIMEOUT: 5000
-  };
-
-  const PANEL_ID =
-    'hitwh-physics-fast-v6';
+  const CONFIG = { DAYS_AHEAD: 100, TIMEOUT_MS: 20000, POLL_MS: 50 };
+  const VERSION = '2026-10-24.1';
+  const PANEL_ID = 'hitwh-physics-fast-v6';
+  const existing = document.getElementById(PANEL_ID);
+  if (existing) {
+    const message = '已有扫描器面板，请先刷新页面，再粘贴新版脚本（' + VERSION + '）。';
+    const status = existing.querySelector('.log');
+    if (status) status.textContent = message;
+    console.warn(message);
+    alert(message);
+    return;
+  }
 
   let running = false;
-  let results = [];
+  let stopped = false;
+  let pending = 0;
+  let failures = 0;
+  let skipped = 0;
+  const events = [];
+  const results = new Map();
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const compact = value => String(value || '').replace(/\s+/g, '');
+  const rawText = el => (el?.innerText || el?.textContent || '').trim();
+  const visible = el => !!el && getComputedStyle(el).visibility !== 'hidden'
+    && el.getClientRects().length > 0;
+  const root = () => [...document.querySelectorAll('.vctch-layout-content.full')].find(visible) || document.body;
+  const knownSections = new Map();
+  function section(label) {
+    const matches = [...root().querySelectorAll('.ant-divider-inner-text')]
+      .filter(el => compact(rawText(el)) === label).map(el => el.closest('.ant-divider')?.parentElement);
+    const shown = matches.find(visible);
+    if (shown) knownSections.set(label, shown);
+    const remembered = knownSections.get(label);
+    return shown || (matches.includes(remembered) ? remembered : matches[0]);
+  }
+  const coursesSection = () => section('请在下面选择实验项目');
+  const datesSection = () => section('选择预约实验的日期和节次');
+  const timesSection = () => section('可选上课时间');
+  const rows = area => [...(area?.querySelectorAll('tr.ant-table-row') || [])];
+  const cellText = cell => (cell?.getAttribute('title') || rawText(cell)).trim();
+  const courseName = row => cellText(row.querySelector('td'));
+  const button = (area, name) => [...(area?.querySelectorAll('button') || [])]
+    .find(el => compact(rawText(el)) === name);
+  const busy = () => [...document.querySelectorAll('.full-loading, .ant-spin-spinning')].some(visible);
+  const stage = () => visible(timesSection()) ? 'TIMES'
+    : visible(datesSection()) ? 'DATES' : visible(coursesSection()) ? 'COURSES' : 'UNKNOWN';
 
-  // ------------------------------------------------
-  // 自适应延迟学习
-  // ------------------------------------------------
-
-  const tune = {
-    stage: 0,
-    select: 0,
-    query: 0,
-    render: 0
-  };
-
-  const sleep = ms =>
-    new Promise(resolve =>
-      setTimeout(resolve, ms)
-    );
-
-  const nextTurn = () =>
-    new Promise(resolve =>
-      setTimeout(resolve, 0)
-    );
-
-  const compact = s =>
-    (s || '').replace(/\s+/g, '');
-
-  const rawText = el =>
-    (
-      el?.innerText ||
-      el?.textContent ||
-      ''
-    ).trim();
-
-  const text = el =>
-    compact(rawText(el));
-
-  function visible(el) {
-    if (!el) {
-      return false;
-    }
-
-    const style =
-      getComputedStyle(el);
-
-    return (
-      style.display !== 'none' &&
-      style.visibility !== 'hidden' &&
-      el.getClientRects().length > 0
-    );
+  function checkStopped() {
+    if (stopped) throw new Error('STOPPED');
   }
 
-  /*
-   * 自适应条件等待：
-   *
-   * 立即检查
-   * -> microtask
-   * -> 0ms timer
-   * -> 1
-   * -> 2
-   * -> 4
-   * ...
-   *
-   * 成功后下次自动降低起点。
-   */
-  async function adaptiveWait(
-    key,
-    condition,
-    timeout,
-    description
-  ) {
-    const started =
-      performance.now();
-
-    let delay =
-      Math.max(
-        0,
-        tune[key] || 0
-      );
-
-    let lastSuccessfulDelay =
-      delay;
-
-    // 第一次零等待直接检查
-    try {
-      const v =
-        condition();
-
-      if (v) {
-        tune[key] = 0;
-        return v;
-      }
-    } catch (_) {}
-
-    // 先只让出 microtask
-    await Promise.resolve();
-
-    try {
-      const v =
-        condition();
-
-      if (v) {
-        tune[key] = 0;
-        return v;
-      }
-    } catch (_) {}
-
-    /*
-     * 再让浏览器真正完成一个 event-loop turn。
-     * setTimeout(0)，不是固定人为等待。
-     */
-    await nextTurn();
-
-    while (
-      performance.now() - started <
-      timeout
-    ) {
-      if (!running) {
-        throw new Error('STOPPED');
-      }
-
-      try {
-        const value =
-          condition();
-
-        if (value) {
-          tune[key] =
-            lastSuccessfulDelay <= 1
-              ? 0
-              : Math.floor(
-                  lastSuccessfulDelay / 2
-                );
-
-          return value;
-        }
-      } catch (_) {}
-
-      if (delay <= 0) {
-        delay = 1;
-      } else {
-        lastSuccessfulDelay =
-          delay;
-
-        await sleep(delay);
-
-        delay =
-          Math.min(
-            delay * 2,
-            CONFIG.MAX_DELAY
-          );
-      }
+  async function waitFor(condition, label) {
+    const deadline = Date.now() + CONFIG.TIMEOUT_MS;
+    while (true) {
+      checkStopped();
+      const value = condition();
+      if (value) return value;
+      if (Date.now() >= deadline) throw new Error('等待超时：' + label);
+      await sleep(CONFIG.POLL_MS);
     }
-
-    throw new Error(
-      `TIMEOUT:${description}`
-    );
-  }
-
-  // ------------------------------------------------
-  // 全局 DOM mutation 序号
-  // ------------------------------------------------
-
-  let mutationVersion = 0;
-
-  new MutationObserver(
-    () => {
-      mutationVersion++;
-    }
-  ).observe(
-    document.documentElement,
-    {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      characterData: true
-    }
-  );
-
-  // ------------------------------------------------
-  // 网络跟踪
-  // ------------------------------------------------
-
-  function installNetworkTracker() {
-    const old =
-      window.__HITWH_FAST_NET__;
-
-    if (old) {
-      return old;
-    }
-
-    let seq = 0;
-
-    const pending =
-      new Set();
-
-    function start() {
-      const id =
-        ++seq;
-
-      pending.add(id);
-
-      return id;
-    }
-
-    function end(id) {
-      pending.delete(id);
-    }
-
-    // fetch
-    if (
-      typeof window.fetch ===
-      'function'
-    ) {
-      const original =
-        window.fetch;
-
-      window.fetch =
-        function (...args) {
-          const id =
-            start();
-
-          try {
-            return Promise.resolve(
-              original.apply(
-                this,
-                args
-              )
-            ).finally(
-              () => end(id)
-            );
-          } catch (e) {
-            end(id);
-            throw e;
-          }
-        };
-    }
-
-    // XHR
-    const originalSend =
-      XMLHttpRequest
-        .prototype
-        .send;
-
-    XMLHttpRequest
-      .prototype
-      .send =
-      function (...args) {
-        const id =
-          start();
-
-        this.addEventListener(
-          'loadend',
-          () => end(id),
-          {
-            once: true
-          }
-        );
-
-        try {
-          return originalSend.apply(
-            this,
-            args
-          );
-        } catch (e) {
-          end(id);
-          throw e;
-        }
-      };
-
-    const tracker = {
-      snapshot() {
-        return seq;
-      },
-
-      startedAfter(n) {
-        return seq > n;
-      },
-
-      pendingAfter(n) {
-        for (
-          const id of pending
-        ) {
-          if (id > n) {
-            return true;
-          }
-        }
-
-        return false;
-      }
-    };
-
-    window.__HITWH_FAST_NET__ =
-      tracker;
-
-    return tracker;
-  }
-
-  const NET =
-    installNetworkTracker();
-
-  // ------------------------------------------------
-  // 基础页面结构
-  // ------------------------------------------------
-
-  function bookingRoot() {
-    return (
-      document.querySelector(
-        '.vctch-layout-content.full'
-      ) ||
-      document.body
-    );
-  }
-
-  function findSection(label) {
-    const target =
-      compact(label);
-
-    const divider = [
-      ...bookingRoot()
-        .querySelectorAll(
-          '.ant-divider-inner-text'
-        )
-    ].find(
-      el =>
-        text(el) === target
-    );
-
-    return (
-      divider
-        ?.closest(
-          '.ant-divider'
-        )
-        ?.parentElement ||
-      null
-    );
-  }
-
-  const courseSection = () =>
-    findSection(
-      '请在下面选择实验项目'
-    );
-
-  const dateSection = () =>
-    findSection(
-      '选择预约实验的日期和节次'
-    );
-
-  const timeSection = () =>
-    findSection(
-      '可选上课时间'
-    );
-
-  function stage() {
-    if (
-      visible(timeSection())
-    ) {
-      return 'TIMES';
-    }
-
-    if (
-      visible(dateSection())
-    ) {
-      return 'DATES';
-    }
-
-    if (
-      visible(courseSection())
-    ) {
-      return 'COURSES';
-    }
-
-    return 'UNKNOWN';
-  }
-
-  async function waitStage(
-    expected
-  ) {
-    return adaptiveWait(
-      'stage',
-
-      () =>
-        stage() === expected,
-
-      CONFIG.STAGE_TIMEOUT,
-
-      `STAGE_${expected}`
-    );
-  }
-
-  function blurEverything() {
-    try {
-      const active =
-        document.activeElement;
-
-      if (
-        active &&
-        active !==
-          document.body
-      ) {
-        active.blur();
-      }
-    } catch (_) {}
   }
 
   function click(el) {
-    if (!el) {
-      throw new Error(
-        'CLICK_TARGET_MISSING'
-      );
-    }
-
-    blurEverything();
-
+    checkStopped();
+    if (!el) throw new Error('找不到操作目标');
+    document.activeElement?.blur();
     el.click();
-
-    /*
-     * Ant Design 有时把焦点留到
-     * 即将隐藏的节点。
-     */
-    queueMicrotask(
-      blurEverything
-    );
   }
 
-  // ------------------------------------------------
-  // 精确按钮
-  // ------------------------------------------------
-
-  function exactButton(
-    root,
-    name
-  ) {
-    if (!root) {
-      return null;
-    }
-
-    const target =
-      compact(name);
-
-    return [
-      ...root.querySelectorAll(
-        'button'
-      )
-    ].find(
-      button =>
-        text(button) === target
-    ) || null;
+  async function waitStage(expected) {
+    await sleep(0);
+    await waitFor(() => stage() === expected && !busy() && !pending, expected);
+    await sleep(0);
   }
 
-  // ------------------------------------------------
-  // 实验
-  // ------------------------------------------------
+  async function waitRows(getSection, label) {
+    await waitFor(() => rows(getSection()).length
+      || [...(getSection()?.querySelectorAll('.ant-empty') || [])].some(visible), label);
+  }
 
-  function getCourseRows() {
-    const root =
-      courseSection();
-
-    if (!root) {
-      return [];
-    }
-
-    return [
-      ...root.querySelectorAll(
-        'tr.ant-table-row'
-      )
-    ].filter(
-      row => {
-        const td =
-          row.querySelector('td');
-
-        const name = (
-          td?.getAttribute(
-            'title'
-          ) ||
-          rawText(td)
-        ).trim();
-
-        return (
-          name &&
-          !/^\d{4}-\d{2}-\d{2}$/
-            .test(name)
-        );
+  // 只在扫描期间观察请求，结束后恢复；查询失败时不把上一时段的数据当成新结果。
+  function trackNetwork() {
+    const originalFetch = window.fetch;
+    const originalSend = XMLHttpRequest.prototype.send;
+    window.fetch = function (...args) {
+      pending++;
+      try {
+        return Promise.resolve(originalFetch.apply(this, args))
+          .then(response => { if (!response.ok) failures++; return response; },
+            error => { failures++; throw error; })
+          .finally(() => pending--);
+      } catch (error) {
+        pending--;
+        failures++;
+        throw error;
       }
-    );
-  }
-
-  function courseName(row) {
-    const td =
-      row.querySelector('td');
-
-    return (
-      td?.getAttribute(
-        'title'
-      ) ||
-      rawText(td)
-    ).trim();
-  }
-
-  async function enterCourse(
-    name
-  ) {
-    if (
-      stage() !== 'COURSES'
-    ) {
-      throw new Error(
-        `ENTER_COURSE_FROM_${stage()}`
-      );
-    }
-
-    const row =
-      getCourseRows()
-        .find(
-          r =>
-            courseName(r) ===
-            name
-        );
-
-    if (!row) {
-      throw new Error(
-        `找不到实验：${name}`
-      );
-    }
-
-    click(row);
-
-    await waitStage(
-      'DATES'
-    );
-  }
-
-  // ------------------------------------------------
-  // 日期
-  // ------------------------------------------------
-
-  function getDateRows() {
-    const root =
-      dateSection();
-
-    if (!root) {
-      return [];
-    }
-
-    return [
-      ...root.querySelectorAll(
-        'tr.ant-table-row'
-      )
-    ].filter(
-      row => {
-        const td =
-          row.querySelector('td');
-
-        const value = (
-          td?.getAttribute(
-            'title'
-          ) ||
-          rawText(td)
-        ).trim();
-
-        return (
-          /^\d{4}-\d{2}-\d{2}$/
-            .test(value)
-        );
+    };
+    XMLHttpRequest.prototype.send = function (...args) {
+      pending++;
+      const done = () => {
+        pending--;
+        if (!this.status || this.status >= 400) failures++;
+      };
+      this.addEventListener('loadend', done, { once: true });
+      try {
+        return originalSend.apply(this, args);
+      } catch (error) {
+        this.removeEventListener('loadend', done);
+        pending--;
+        failures++;
+        throw error;
       }
-    );
-  }
-
-  function parseDateRow(row) {
-    const td = [
-      ...row.querySelectorAll(
-        'td'
-      )
-    ];
-
-    return {
-      date: (
-        td[0]
-          ?.getAttribute(
-            'title'
-          ) ||
-        rawText(td[0])
-      ).trim(),
-
-      week:
-        rawText(td[1]),
-
-      weekday: (
-        td[2]
-          ?.getAttribute(
-            'title'
-          ) ||
-        rawText(td[2])
-      ).trim()
+    };
+    return () => {
+      window.fetch = originalFetch;
+      XMLHttpRequest.prototype.send = originalSend;
     };
   }
 
-  function withinHorizon(
-    date
-  ) {
-    const d =
-      new Date(
-        `${date}T00:00:00`
-      );
-
-    const today =
-      new Date();
-
-    today.setHours(
-      0,
-      0,
-      0,
-      0
-    );
-
-    const max =
-      new Date(today);
-
-    max.setDate(
-      max.getDate() +
-      CONFIG.DAYS_AHEAD
-    );
-
-    return (
-      d >= today &&
-      d <= max
-    );
+  async function enterCourse(name) {
+    click(rows(coursesSection()).find(row => courseName(row) === name));
+    await waitStage('DATES');
+    await waitRows(datesSection, '日期列表：' + name);
   }
 
-  async function enterDate(
-    date
-  ) {
-    if (
-      stage() !== 'DATES'
-    ) {
-      throw new Error(
-        `ENTER_DATE_FROM_${stage()}`
-      );
-    }
-
-    const row =
-      getDateRows()
-        .find(
-          r =>
-            parseDateRow(r)
-              .date ===
-            date
-        );
-
-    if (!row) {
-      throw new Error(
-        `找不到日期：${date}`
-      );
-    }
-
-    click(row);
-
-    await waitStage(
-      'TIMES'
-    );
-  }
-
-  // ------------------------------------------------
-  // 关键：
-  // TIMES -> COURSES
-  // ------------------------------------------------
-
-  /*
-   * 日期页的“返 回”按钮虽然 TIMES 时
-   * 对应 section 被隐藏，但 handler 仍挂着。
-   *
-   * 与直接点隐藏课程行不同，
-   * 这是页面自己提供的状态转换。
-   *
-   * 点它后应回 COURSES。
-   */
   async function returnToCourses() {
-    if (
-      stage() === 'COURSES'
-    ) {
-      return;
-    }
-
-    const root =
-      dateSection();
-
-    const back =
-      exactButton(
-        root,
-        '返回'
-      );
-
-    if (!back) {
-      throw new Error(
-        '找不到日期页面的“返 回”按钮'
-      );
-    }
-
-    click(back);
-
-    await waitStage(
-      'COURSES'
-    );
+    if (stage() === 'COURSES') return;
+    // 原页面的日期区块即使隐藏，其返回按钮仍负责回到实验目录。
+    click(button(datesSection(), '返回'));
+    await waitStage('COURSES');
   }
 
-  // ------------------------------------------------
-  // 大节
-  // ------------------------------------------------
-
-  function getTimeCards() {
-    const root =
-      timeSection();
-
-    if (!root) {
-      return [];
-    }
-
-    return [
-      ...root.querySelectorAll(
-        '.radio-item'
-      )
-    ].filter(
-      card =>
-        /第[一二三四五六七八九十]+大节/
-          .test(
-            rawText(card)
-          )
-    );
+  function normalizeDate(value) {
+    const match = String(value || '').trim().match(/^(\d{4})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})(?:日|(?=[T\s]|$))/);
+    if (!match) return '';
+    const [year, month, day] = match.slice(1).map(Number);
+    const date = new Date(year, month - 1, day);
+    if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day) return '';
+    return [year, String(month).padStart(2, '0'), String(day).padStart(2, '0')].join('-');
   }
 
-  function parseTimeCard(
-    card
-  ) {
-    const s =
-      rawText(card)
-        .replace(
-          /\s+/g,
-          ' '
-        );
+  function dateInfo(row) {
+    const cells = [...row.querySelectorAll('td')];
+    const dates = cells.map(cell => normalizeDate(cell.getAttribute('title')) || normalizeDate(rawText(cell)));
+    const index = dates.findIndex(Boolean);
+    return { date: dates[index] || '', week: rawText(cells[index + 1]), weekday: cellText(cells[index + 2]) };
+  }
 
+  function withinHorizon(date) {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const limit = new Date(today);
+    limit.setDate(limit.getDate() + CONFIG.DAYS_AHEAD);
+    const value = new Date(date + 'T00:00:00');
+    return value >= today && value <= limit;
+  }
+
+  const timeCards = () => [...(timesSection()?.querySelectorAll('.radio-item') || [])]
+    .filter(card => /第[一二三四五六七八九十]+大节/.test(rawText(card)));
+
+  function timeInfo(card) {
+    const text = rawText(card);
     return {
-      period:
-        s.match(
-          /第[一二三四五六七八九十]+大节/
-        )?.[0] ||
-        s,
-
-      start:
-        s.match(
-          /开始时间[:：]\s*([0-9:]+)/
-        )?.[1] ||
-        ''
+      period: text.match(/第[一二三四五六七八九十]+大节/)?.[0],
+      start: text.match(/开始时间[:：]\s*([0-9:]+)/)?.[1] || ''
     };
   }
 
-  // ------------------------------------------------
-  // 座位
-  // ------------------------------------------------
-
-  function getSeatCards() {
-    const root =
-      timeSection();
-
-    if (!root) {
-      return [];
-    }
-
-    return [
-      ...root.querySelectorAll(
-        '.ant-card'
-      )
-    ].filter(
-      card =>
-        /座位\s*[:：]\s*\d+/
-          .test(
-            rawText(card)
-          )
-    );
-  }
-
-  function seatSignature() {
-    return getSeatCards()
-      .map(
-        x =>
-          compact(
-            rawText(x)
-          )
-      )
-      .join('|');
-  }
-
-  function getSeatInfo() {
-    const root =
-      timeSection();
-
-    const cards =
-      getSeatCards();
-
-    const free =
-      cards.filter(
-        x =>
-          /状态\s*[:：]\s*空闲/
-            .test(
-              rawText(x)
-            )
-      ).length;
-
-    const room =
-      rawText(root)
-        .match(
-          /实验室名称\s*[:：]\s*([^\n\r]+)/
-        )?.[1]
-        ?.trim() ||
-      '';
-
+  async function queryTime(period) {
+    const card = timeCards().find(el => timeInfo(el).period === period);
+    click(card?.querySelector('input[type="radio"]') || card);
+    await sleep(0);
+    const beforeFailures = failures;
+    click(button(timesSection(), '查询'));
+    // 给点击处理、缓存读取和渲染一个事件循环；只有实际加载时才继续等待。
+    await sleep(0);
+    await waitFor(() => !pending && !busy(), period);
+    await sleep(0);
+    checkStopped();
+    if (failures !== beforeFailures) throw new Error('查询请求失败：' + period);
+    const area = timesSection();
+    const seats = [...area.querySelectorAll('.ant-card')]
+      .filter(el => /座位\s*[:：]\s*\d+/.test(rawText(el)));
     return {
-      free,
-      total:
-        cards.length,
-      room
+      free: seats.filter(el => /状态\s*[:：]\s*空闲/.test(rawText(el))).length,
+      total: seats.length,
+      room: rawText(area).match(/实验室名称\s*[:：]\s*([^\n\r]+)/)?.[1]?.trim() || ''
     };
   }
-
-  // ------------------------------------------------
-  // 查询
-  // ------------------------------------------------
-
-  /*
-   * 查询完成判据：
-   *
-   * 不再要求网络请求。
-   *
-   * 下列任意一种发生即可：
-   *
-   * 1. 新网络请求完成
-   * 2. DOM 发生改变
-   * 3. loading 出现后消失
-   * 4. 座位结果改变
-   * 5. 什么都没发生：
-   *    一个 event-loop turn 后直接接受当前结果
-   *
-   * 第 5 条很重要：
-   * 缓存结果 / 同样结果不会再卡 5~10 秒。
-   */
-  async function queryTime(
-    period
-  ) {
-    const root =
-      timeSection();
-
-    if (!root) {
-      throw new Error(
-        'TIME_SECTION_MISSING'
-      );
-    }
-
-    const card =
-      getTimeCards()
-        .find(
-          x =>
-            parseTimeCard(x)
-              .period ===
-            period
-        );
-
-    if (!card) {
-      throw new Error(
-        `找不到 ${period}`
-      );
-    }
-
-    const radio =
-      card.querySelector(
-        'input[type="radio"]'
-      );
-
-    click(
-      radio || card
-    );
-
-    if (radio) {
-      try {
-        await adaptiveWait(
-          'select',
-
-          () =>
-            radio.checked,
-
-          300,
-
-          `SELECT_${period}`
-        );
-      } catch (_) {
-        /*
-         * Ant Design 有时真实状态
-         * 不直接体现在 native checked。
-         *
-         * 不因此失败。
-         */
-      }
-    }
-
-    const beforeNet =
-      NET.snapshot();
-
-    const beforeMutation =
-      mutationVersion;
-
-    const beforeSeats =
-      seatSignature();
-
-    const query =
-      exactButton(
-        root,
-        '查询'
-      );
-
-    if (!query) {
-      throw new Error(
-        '找不到当前区块内“查询”按钮'
-      );
-    }
-
-    click(query);
-
-    /*
-     * 先让点击 handler + Promise microtask
-     * 有机会执行。
-     *
-     * 没有固定 ms。
-     */
-    await Promise.resolve();
-    await Promise.resolve();
-
-    /*
-     * 再让一个最小 event-loop turn。
-     */
-    await nextTurn();
-
-    /*
-     * 情况 A：
-     * 真的产生网络请求。
-     */
-    if (
-      NET.startedAfter(
-        beforeNet
-      )
-    ) {
-      try {
-        await adaptiveWait(
-          'query',
-
-          () =>
-            !NET.pendingAfter(
-              beforeNet
-            ),
-
-          CONFIG.NETWORK_TIMEOUT,
-
-          `QUERY_NETWORK_${period}`
-        );
-      } catch (e) {
-        /*
-         * 即使网络 tracker 不完善，
-         * 也不让一个时段卡整个扫描。
-         */
-        console.warn(
-          '[查询网络等待超时，直接读取页面]',
-          period
-        );
-      }
-
-      await Promise.resolve();
-      await Promise.resolve();
-
-      return getSeatInfo();
-    }
-
-    /*
-     * 情况 B：
-     * 没网络，但 DOM 已同步更新。
-     */
-    if (
-      mutationVersion >
-        beforeMutation ||
-      seatSignature() !==
-        beforeSeats
-    ) {
-      return getSeatInfo();
-    }
-
-    /*
-     * 情况 C：
-     * 没网络、没 DOM 变化。
-     *
-     * 很可能：
-     * - 数据来自缓存
-     * - 当前结果与上一个完全相同
-     *
-     * 这时不能等 10 秒。
-     *
-     * 只使用当前学到的最小 render delay。
-     */
-    let delay =
-      tune.render || 0;
-
-    if (delay > 0) {
-      await sleep(delay);
-    }
-
-    /*
-     * 再检查一次。
-     */
-    if (
-      mutationVersion >
-        beforeMutation ||
-      seatSignature() !==
-        beforeSeats
-    ) {
-      tune.render =
-        delay <= 1
-          ? 0
-          : Math.floor(
-              delay / 2
-            );
-    } else {
-      /*
-       * 下次稍微增加，
-       * 但本次绝不阻塞。
-       */
-      tune.render =
-        delay === 0
-          ? 1
-          : Math.min(
-              delay * 2,
-              CONFIG.MAX_DELAY
-            );
-    }
-
-    return getSeatInfo();
-  }
-
-  // ------------------------------------------------
-  // 结果
-  // ------------------------------------------------
-
-  function addResult(row) {
-    const key =
-      `${row.course}|${row.date}|${row.period}`;
-
-    const index =
-      results.findIndex(
-        r =>
-          `${r.course}|${r.date}|${r.period}` ===
-          key
-      );
-
-    if (index >= 0) {
-      results[index] =
-        row;
-    } else {
-      results.push(row);
-    }
-
-    render();
-  }
-
-  // ------------------------------------------------
-  // 主循环
-  // ------------------------------------------------
 
   async function scanAll() {
-    if (running) {
+    if (running) return;
+    if (stage() !== 'COURSES') {
+      alert('请先手动回到“预约选课”的实验列表。');
       return;
     }
-
-    if (
-      stage() !== 'COURSES'
-    ) {
-      alert(
-        '请先手动回到“预约选课”的实验列表。'
-      );
-
-      return;
-    }
-
     running = true;
-
-    results = [];
-
+    stopped = false;
+    skipped = 0;
+    events.length = 0;
+    results.clear();
     render();
-
-    const courses =
-      getCourseRows()
-        .map(courseName)
-        .filter(Boolean);
-
+    const restoreNetwork = trackNetwork();
     try {
-      for (
-        let ci = 0;
-        ci < courses.length;
-        ci++
-      ) {
-        const course =
-          courses[ci];
-
-        log(
-          `[${ci + 1}/${courses.length}] ${course}`
-        );
-
-        /*
-         * 先进入一次课程，
-         * 取得日期快照。
-         */
-        await enterCourse(
-          course
-        );
-
-        const dates =
-          getDateRows()
-            .map(
-              parseDateRow
-            )
-            .filter(
-              x =>
-                withinHorizon(
-                  x.date
-                )
-            );
-
-        /*
-         * 返回实验列表。
-         *
-         * 后面每一个日期都重新
-         * 从 COURSES -> DATES -> TIMES。
-         *
-         * 不再依赖隐藏列表直接跨状态跳转。
-         */
+      await waitRows(coursesSection, '实验列表');
+      const courses = rows(coursesSection()).map(courseName)
+        .filter(name => name && !/^\d{4}-\d{2}-\d{2}$/.test(name));
+      if (!courses.length) throw new Error('未识别到实验名称，请导出诊断');
+      for (const [index, course] of courses.entries()) {
+        checkStopped();
+        log(`[${index + 1}/${courses.length}] ${course}`);
+        await enterCourse(course);
+        const dateRows = rows(datesSection());
+        const recognized = dateRows.map(dateInfo).filter(row => row.date);
+        if (dateRows.length && !recognized.length) throw new Error('无法识别日期列，请导出诊断：' + course);
+        const dates = recognized.filter(row => withinHorizon(row.date));
+        log(`${course}：日期 ${dateRows.length} 行，识别 ${recognized.length} 行，未来 ${CONFIG.DAYS_AHEAD} 天内 ${dates.length} 行`);
+        if (!dates.length) skipped++;
         await returnToCourses();
-
-        for (
-          let di = 0;
-          di < dates.length;
-          di++
-        ) {
-          if (!running) {
-            throw new Error(
-              'STOPPED'
-            );
-          }
-
-          const d =
-            dates[di];
-
-          log(
-            `${course}：${d.date} ${d.weekday}`
-          );
-
-          /*
-           * 每次日期：
-           *
-           * COURSES
-           * -> 当前实验
-           * -> DATES
-           * -> 当前日期
-           * -> TIMES
-           */
+        for (const date of dates) {
+          checkStopped();
           try {
-            await enterCourse(
-              course
-            );
-
-            await enterDate(
-              d.date
-            );
-          } catch (e) {
-            console.warn(
-              '[进入日期失败]',
-              course,
-              d.date,
-              e
-            );
-
-            /*
-             * 尝试恢复实验列表。
-             */
-            try {
-              await returnToCourses();
-            } catch (_) {}
-
-            continue;
-          }
-
-          const times =
-            getTimeCards()
-              .map(
-                parseTimeCard
-              );
-
-          for (
-            const tm of times
-          ) {
-            if (!running) {
-              throw new Error(
-                'STOPPED'
-              );
+            await enterCourse(course);
+            click(rows(datesSection()).find(row => dateInfo(row).date === date.date));
+            await waitStage('TIMES');
+            for (const time of timeCards().map(timeInfo)) {
+              checkStopped();
+              log(`${course}：${date.date} ${time.period}`);
+              try {
+                const seats = await queryTime(time.period);
+                const value = { course, ...date, ...time, ...seats };
+                results.set(JSON.stringify([course, date.date, time.period]), value);
+                render();
+              } catch (error) {
+                if (stopped) throw error;
+                skipped++;
+                console.warn('[时段查询失败]', course, date.date, time.period, error);
+                log(`查询失败：${course} ${date.date} ${time.period}，已跳过`);
+              }
             }
-
-            log(
-              `${course}：${d.date} ${tm.period}`
-            );
-
-            try {
-              const seat =
-                await queryTime(
-                  tm.period
-                );
-
-              addResult({
-                course,
-
-                date:
-                  d.date,
-
-                weekday:
-                  d.weekday,
-
-                week:
-                  d.week,
-
-                period:
-                  tm.period,
-
-                start:
-                  tm.start,
-
-                free:
-                  seat.free,
-
-                total:
-                  seat.total,
-
-                room:
-                  seat.room
-              });
-
-            } catch (e) {
-              console.error(
-                '[单时段查询失败]',
-                course,
-                d.date,
-                tm.period,
-                e
-              );
-            }
+          } catch (error) {
+            if (stopped) throw error;
+            skipped++;
+            console.warn('[日期查询失败]', course, date.date, error);
+            log(`日期查询失败：${course} ${date.date}，已跳过`);
           }
-
-          /*
-           * TIMES
-           * -> 日期页自己的隐藏“返 回”
-           * -> COURSES
-           */
-          try {
-            await returnToCourses();
-
-          } catch (e) {
-            console.error(
-              '[无法恢复实验列表]',
-              course,
-              d.date,
-              e
-            );
-
-            throw e;
-          }
+          await returnToCourses();
         }
       }
-
-      log(
-        `完成：扫描 ${results.length} 个时段，其中 ${
-          results.filter(
-            r => r.free > 0
-          ).length
-        } 个有空位`
-      );
-
-    } catch (e) {
-      if (
-        String(
-          e?.message || e
-        ) === 'STOPPED'
-      ) {
-        log(
-          `已停止，保留 ${results.length} 条结果`
-        );
-
-      } else {
-        console.error(
-          '[扫描中断]',
-          e
-        );
-
-        log(
-          `扫描中断：${
-            e?.message || e
-          }`
-        );
-      }
-
+      log(`完成：扫描 ${results.size} 个时段，${[...results.values()].filter(row => row.free > 0).length} 个有空位，跳过/失败 ${skipped} 项`);
+    } catch (error) {
+      if (!stopped) console.error('[扫描中断]', error);
+      log(stopped ? `已停止，保留 ${results.size} 条结果` : '扫描中断：' + error.message + '；可导出诊断');
     } finally {
+      restoreNetwork();
       running = false;
+      render();
     }
   }
-
-  // ------------------------------------------------
-  // CSV
-  // ------------------------------------------------
 
   function exportCsv() {
-    const rows = [
-      [
-        '实验',
-        '日期',
-        '星期',
-        '周次',
-        '大节',
-        '开始时间',
-        '空闲座位',
-        '总座位',
-        '实验室'
-      ],
+    const fields = ['course', 'date', 'weekday', 'week', 'period', 'start', 'free', 'total', 'room'];
+    const data = [['实验', '日期', '星期', '周次', '大节', '开始时间', '空闲座位', '总座位', '实验室'],
+      ...[...results.values()].map(row => fields.map(key => row[key]))];
+    const csv = '\uFEFF' + data.map(row => row.map(value =>
+      '"' + String(value ?? '').replace(/"/g, '""') + '"').join(',')).join('\n');
+    download('大物实验空余时段.csv', 'text/csv;charset=utf-8', csv);
+  }
 
-      ...results.map(
-        r => [
-          r.course,
-          r.date,
-          r.weekday,
-          r.week,
-          r.period,
-          r.start,
-          r.free,
-          r.total,
-          r.room
-        ]
-      )
-    ];
-
-    const csv =
-      '\uFEFF' +
-      rows
-        .map(
-          row =>
-            row
-              .map(
-                value =>
-                  `"${String(
-                    value ?? ''
-                  ).replace(
-                    /"/g,
-                    '""'
-                  )}"`
-              )
-              .join(',')
-        )
-        .join('\n');
-
-    const blob =
-      new Blob(
-        [csv],
-        {
-          type:
-            'text/csv;charset=utf-8'
-        }
-      );
-
-    const link =
-      document.createElement(
-        'a'
-      );
-
-    link.href =
-      URL.createObjectURL(
-        blob
-      );
-
-    link.download =
-      '大物实验空余时段.csv';
-
+  function download(name, type, content) {
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(new Blob([content], { type }));
+    link.download = name;
+    document.body.appendChild(link);
     link.click();
-
-    URL.revokeObjectURL(
-      link.href
-    );
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
   }
 
-  // ------------------------------------------------
-  // UI
-  // ------------------------------------------------
-
-  function esc(s) {
-    return String(
-      s ?? ''
-    ).replace(
-      /[&<>"']/g,
-      ch => ({
-        '&': '&amp;',
-        '<': '&lt;',
-        '>': '&gt;',
-        '"': '&quot;',
-        "'": '&#39;'
-      }[ch])
-    );
+  function exportDiagnostic() {
+    const preview = area => rows(area).slice(0, 5).map(row => [...row.querySelectorAll('td')]
+      .map(cell => ({ text: rawText(cell), title: cell.getAttribute('title') })));
+    const report = { version: VERSION, computerTime: new Date().toString(), stage: stage(),
+      pendingRequests: pending, resultCount: results.size, skipped,
+      courses: preview(coursesSection()), dates: preview(datesSection()),
+      headings: [...root().querySelectorAll('.ant-divider-inner-text')].map(el =>
+        ({ text: rawText(el), visible: visible(el) })), events };
+    download('大物实验扫描诊断.json', 'application/json;charset=utf-8', JSON.stringify(report, null, 2));
   }
+
+  const esc = value => String(value ?? '').replace(/[&<>"']/g,
+    ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
 
   function render() {
-    const tbody =
-      document.querySelector(
-        `#${PANEL_ID} tbody`
-      );
-
-    if (!tbody) {
-      return;
-    }
-
-    const sorted =
-      [...results].sort(
-        (a, b) =>
-          a.date.localeCompare(
-            b.date
-          ) ||
-          a.course.localeCompare(
-            b.course
-          ) ||
-          a.period.localeCompare(
-            b.period
-          )
-      );
-
-    tbody.innerHTML =
-      sorted
-        .map(
-          r => `
-            <tr class="${
-              r.free > 0
-                ? 'free'
-                : 'full'
-            }">
-
-              <td>
-                ${esc(r.course)}
-              </td>
-
-              <td>
-                ${esc(r.date)}
-                <br>
-                <small>
-                  ${esc(r.weekday)}
-                </small>
-              </td>
-
-              <td>
-                ${esc(r.period)}
-              </td>
-
-              <td>
-                <b>${r.free}</b>
-                /
-                ${r.total}
-              </td>
-
-              <td>
-                ${esc(
-                  r.room || '-'
-                )}
-              </td>
-
-            </tr>
-          `
-        )
-        .join('');
-
-    const stats =
-      document.querySelector(
-        `#${PANEL_ID} .stats`
-      );
-
-    if (stats) {
-      stats.textContent =
-        `结果 ${results.length} | ` +
-        `stage ${tune.stage}ms | ` +
-        `select ${tune.select}ms | ` +
-        `render ${tune.render}ms`;
-    }
+    panel.querySelector('.start').disabled = running;
+    panel.querySelector('.stop').disabled = !running || stopped;
+    const sorted = [...results.values()].sort((a, b) => a.date.localeCompare(b.date)
+      || a.course.localeCompare(b.course) || a.period.localeCompare(b.period));
+    panel.querySelector('tbody').innerHTML = sorted.map(row =>
+      `<tr class="${row.free > 0 ? 'free' : 'full'}"><td>${esc(row.course)}</td>
+      <td>${esc(row.date)}<br><small>${esc(row.weekday)}</small></td>
+      <td>${esc(row.period)}<br>${esc(row.start)}</td><td>${row.free}/${row.total}</td>
+      <td>${esc(row.room || '-')}</td></tr>`).join('');
+    panel.querySelector('.stats').textContent = `结果 ${results.size} | 有空位 ${sorted.filter(row => row.free > 0).length} | 跳过/失败 ${skipped}`;
   }
 
   function log(message) {
-    console.log(
-      '[空余时段扫描器]',
-      message
-    );
-
-    const el =
-      document.querySelector(
-        `#${PANEL_ID} .log`
-      );
-
-    if (el) {
-      el.textContent =
-        message;
-    }
-
-    render();
+    events.push({ time: new Date().toLocaleTimeString(), message });
+    if (events.length > 50) events.shift();
+    console.log('[空余时段扫描器]', message);
+    panel.querySelector('.log').textContent = message;
   }
 
-  function createPanel() {
-    document
-      .getElementById(
-        PANEL_ID
-      )
-      ?.remove();
-
-    const panel =
-      document.createElement(
-        'div'
-      );
-
-    panel.id =
-      PANEL_ID;
-
-    panel.innerHTML = `
-      <div class="head">
-        <b>
-          大物实验极速扫描 v6
-        </b>
-
-        <span class="log">
-          待机
-        </span>
-      </div>
-
-      <div class="actions">
-        <button class="start">
-          扫描未来 ${CONFIG.DAYS_AHEAD} 天
-        </button>
-
-        <button class="stop">
-          停止
-        </button>
-
-        <button class="csv">
-          导出 CSV
-        </button>
-
-        <span class="stats"></span>
-      </div>
-
-      <div class="body">
-        <table>
-          <thead>
-            <tr>
-              <th>实验</th>
-              <th>日期</th>
-              <th>大节</th>
-              <th>空闲/总数</th>
-              <th>实验室</th>
-            </tr>
-          </thead>
-
-          <tbody></tbody>
-        </table>
-      </div>
-    `;
-
-    const style =
-      document.createElement(
-        'style'
-      );
-
-    style.textContent = `
-      #${PANEL_ID} {
-        position: fixed;
-        right: 12px;
-        bottom: 12px;
-        width: 780px;
-        max-width: calc(100vw - 24px);
-        max-height: 72vh;
-        z-index: 2147483647;
-        background: white;
-        color: #222;
-        border: 1px solid #aaa;
-        border-radius: 8px;
-        box-shadow: 0 6px 24px #0003;
-        font: 14px/1.4 sans-serif;
-        overflow: hidden;
-      }
-
-      #${PANEL_ID} .head {
-        display: flex;
-        gap: 12px;
-        align-items: center;
-        padding: 9px 12px;
-        background: #f5f6f7;
-        border-bottom: 1px solid #ddd;
-      }
-
-      #${PANEL_ID} .log {
-        flex: 1;
-        color: #666;
-        overflow: hidden;
-        white-space: nowrap;
-        text-overflow: ellipsis;
-      }
-
-      #${PANEL_ID} .actions {
-        display: flex;
-        gap: 7px;
-        align-items: center;
-        flex-wrap: wrap;
-        padding: 8px 12px;
-        border-bottom: 1px solid #eee;
-      }
-
-      #${PANEL_ID} button {
-        padding: 5px 9px;
-        cursor: pointer;
-      }
-
-      #${PANEL_ID} .stats {
-        margin-left: auto;
-        color: #666;
-        font-size: 11px;
-      }
-
-      #${PANEL_ID} .body {
-        max-height: 54vh;
-        overflow: auto;
-      }
-
-      #${PANEL_ID} table {
-        width: 100%;
-        border-collapse: collapse;
-        font-size: 12px;
-      }
-
-      #${PANEL_ID} th,
-      #${PANEL_ID} td {
-        padding: 6px;
-        border-bottom: 1px solid #eee;
-        text-align: left;
-        vertical-align: top;
-      }
-
-      #${PANEL_ID} th {
-        position: sticky;
-        top: 0;
-        background: #fafafa;
-      }
-
-      #${PANEL_ID} tr.free {
-        background: #f3fff3;
-      }
-
-      #${PANEL_ID} tr.full {
-        opacity: .55;
-      }
-    `;
-
-    document.head
-      .appendChild(
-        style
-      );
-
-    document.body
-      .appendChild(
-        panel
-      );
-
-    panel
-      .querySelector(
-        '.start'
-      )
-      .onclick =
-      scanAll;
-
-    panel
-      .querySelector(
-        '.stop'
-      )
-      .onclick =
-      () => {
-        running = false;
-        log('正在停止…');
-      };
-
-    panel
-      .querySelector(
-        '.csv'
-      )
-      .onclick =
-      exportCsv;
-
-    render();
-  }
-
-  createPanel();
-
+  const panel = document.createElement('div');
+  panel.id = PANEL_ID;
+  panel.innerHTML = `
+    <style>
+      #${PANEL_ID}{position:fixed;right:12px;bottom:12px;width:780px;max-width:calc(100vw - 24px);max-height:72vh;z-index:2147483647;background:white;color:#222;border:1px solid #aaa;border-radius:8px;box-shadow:0 6px 24px #0003;font:14px/1.4 sans-serif;overflow:hidden}
+      #${PANEL_ID} .head,#${PANEL_ID} .actions{display:flex;gap:10px;align-items:center;padding:9px 12px;border-bottom:1px solid #eee;flex-wrap:wrap}
+      #${PANEL_ID} .head{background:#f5f6f7}
+      #${PANEL_ID} .log{flex:1;color:#666;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+      #${PANEL_ID} .stats{margin-left:auto;color:#666;font-size:12px}
+      #${PANEL_ID} button{padding:5px 9px;cursor:pointer}
+      #${PANEL_ID} .body{max-height:54vh;overflow:auto}
+      #${PANEL_ID} table{width:100%;border-collapse:collapse;font-size:12px}
+      #${PANEL_ID} th,#${PANEL_ID} td{padding:6px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}
+      #${PANEL_ID} th{position:sticky;top:0;background:#fafafa}
+      #${PANEL_ID} tr.free{background:#f3fff3}
+      #${PANEL_ID} tr.full{opacity:.55}
+    </style>
+    <div class="head"><b>空余时段扫描 ${VERSION}</b><span class="log">待机</span></div>
+    <div class="actions"><button class="start">扫描未来 ${CONFIG.DAYS_AHEAD} 天</button>
+      <button class="stop">停止</button><button class="csv">导出 CSV</button>
+      <button class="diagnostic">导出诊断</button><span class="stats"></span></div>
+    <div class="body"><table><thead><tr><th>实验</th><th>日期</th><th>大节</th>
+      <th>空闲/总数</th><th>实验室</th></tr></thead><tbody></tbody></table></div>`;
+  document.body.appendChild(panel);
+  panel.querySelector('.start').onclick = scanAll;
+  panel.querySelector('.stop').onclick = () => { stopped = true; log('正在停止…'); render(); };
+  panel.querySelector('.csv').onclick = exportCsv;
+  panel.querySelector('.diagnostic').onclick = exportDiagnostic;
+  render();
 })();

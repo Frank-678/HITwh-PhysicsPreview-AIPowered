@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         物理实验系统自动答题 Agent
 // @namespace    http://tampermonkey.net/
-// @version      2.1.0
+// @version      2.1.2
 // @description  基于真实 DOM 结构的自动化考试执行脚本
 // @author       Frank
 // @match        http://openlab.hitwh.edu.cn/dxwl/*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_registerMenuCommand
 // @connect      generativelanguage.googleapis.com
 // @run-at       document-idle
 // ==/UserScript==
@@ -16,7 +17,9 @@
 const CONFIG = {
         API_KEY: "",
         MODEL: "gemini-2.5-flash",
-        DELAY_MS: 3000
+        DELAY_MS: 3000,
+        LOAD_TIMEOUT_MS: 20000, // 题目及页面切换最多等待 20 秒，可按网络情况调整
+        MAX_RETRIES: 4
     };
 
     const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -27,6 +30,68 @@ const CONFIG = {
     }
 
 
+
+    const SKIP_KEY = "LSM_SKIPPED_EXPERIMENTS";
+    let skippedExperiments;
+    try {
+        skippedExperiments = new Set(JSON.parse(sessionStorage.getItem(SKIP_KEY) || "[]"));
+    } catch (_) {
+        skippedExperiments = new Set();
+    }
+    let currentExperiment = null;
+    let openingSince = 0;
+
+    function getExperiment(row) {
+        const name = row.querySelector("span[style*='font-weight: bold']")?.innerText.trim()
+            || row.innerText.split("\n")[0].trim();
+        return { id: row.getAttribute("data-row-key") || name, name };
+    }
+
+    // 捕获手动和自动点击，避免沿用上一个实验名称。
+    document.addEventListener("click", event => {
+        const row = event.target.closest?.("tr.ant-table-row");
+        if (row && isVisible(row) && row.innerText.includes("未通过") && row.innerText.includes("可考试")) {
+            currentExperiment = getExperiment(row);
+            openingSince = Date.now();
+        }
+    }, true);
+
+    GM_registerMenuCommand("重新尝试已跳过实验", () => {
+        sessionStorage.removeItem(SKIP_KEY);
+        location.reload();
+    });
+
+    function skipExperiment(experiment, reason) {
+        if (experiment) {
+            skippedExperiments.add(experiment.id);
+            sessionStorage.setItem(SKIP_KEY, JSON.stringify([...skippedExperiments]));
+        }
+        console.warn(`暂时跳过【${experiment?.name || "未确认的实验"}】：${reason}。可从脚本菜单重新尝试。`);
+        location.reload();
+    }
+
+    async function waitFor(test) {
+        const deadline = Date.now() + CONFIG.LOAD_TIMEOUT_MS;
+        while (!test()) {
+            if (Date.now() >= deadline) return false;
+            await sleep(500);
+        }
+        return true;
+    }
+
+    async function waitForQuestions(samePaper) {
+        let cards = [];
+        const ready = await waitFor(() => {
+            cards = Array.from(document.querySelectorAll(".ant-card-bordered"))
+                .filter(card => isVisible(card) && card.innerText.includes("试题:"));
+            const loading = Array.from(document.querySelectorAll(".full-loading, .ant-spin-spinning")).some(isVisible);
+            return !samePaper() || (!loading && cards.length > 0 && cards.every(card =>
+                card.querySelector("div[style='padding: 12px;'] > div:nth-child(2)")?.innerText.trim()
+                && card.querySelector(".exam-radio input[type='radio']")));
+        });
+        return ready ? cards : [];
+    }
+
 // 决策模块：调用大模型（附带底层现象探针与防并发限流机制）
     function getDecisionFromAPI(question, options) {
         return new Promise((resolve, reject) => {
@@ -36,6 +101,7 @@ const CONFIG = {
                 method: "POST",
                 url: `https://generativelanguage.googleapis.com/v1beta/models/${CONFIG.MODEL}:generateContent?key=${CONFIG.API_KEY}`,
                 headers: { "Content-Type": "application/json" },
+                timeout: 45000,
                 data: JSON.stringify({
                     contents: [{ parts: [{ text: prompt }] }]
                 }),
@@ -59,13 +125,15 @@ const CONFIG = {
                         }
 
                         const answer = resJson.candidates[0].content.parts[0].text.trim().toUpperCase();
-                        const match = answer.match(/[A-D]/);
-                        resolve(match ? match[0] : "A");
+                        const match = answer.match(/^[A-D]$/);
+                        if (!match) throw new Error("INVALID_ANSWER");
+                        resolve(match[0]);
                     } catch (e) {
                         console.error("[解析层严重错误]:", e);
                         reject("大模型返回数据解析异常");
                     }
                 },
+                ontimeout: function() { reject("TIMEOUT"); },
                 onerror: function(err) {
                     console.error("[底层网络错误]: 无法连接到目标服务器");
                     reject("网络请求底层的通信错误");
@@ -74,116 +142,96 @@ const CONFIG = {
         });
     }
 
-    // 主调度状态机
-    async function runAgent() {
-        console.log("Agent 2.0 已加载，监听系统 DOM 状态中...");
+    // 主调度：空题与失败实验暂时跳过，避免提交不完整试卷。
+    async function runAgent() {
+        console.log("Agent (Gemini) 启动。");
+        agentLoop: while (true) {
+            await sleep(CONFIG.DELAY_MS);
+            const buttons = Array.from(document.querySelectorAll("button"));
+            const submitBtn = buttons.find(b => b.innerText.includes("提交答案") && isVisible(b));
+            const returnBtn = buttons.find(b => b.innerText.replace(/\s/g, "") === "返回" && isVisible(b));
 
-        while (true) {
-            await sleep(CONFIG.DELAY_MS);
+            if (submitBtn) {
+                openingSince = 0;
+                const experiment = currentExperiment;
+                const samePaper = () => currentExperiment === experiment && isVisible(submitBtn);
+                const cards = await waitForQuestions(samePaper);
+                if (!samePaper()) continue;
+                if (!cards.length) {
+                    skipExperiment(experiment, "等待题目超时，可能尚未发布或加载失败");
+                    return;
+                }
 
-            // 探索页面中是否存在“提交答案”按钮，借此判定是否处于考试页面
-            const buttons = Array.from(document.querySelectorAll("button"));
-            const submitBtn = buttons.find(b => b.innerText.includes("提交答案") && isVisible(b));
-            const returnBtn = buttons.find(b => b.innerText.includes("返 回") && isVisible(b));
+                for (const card of cards) {
+                    const title = card.querySelector("div[style='padding: 12px;'] > div:nth-child(2)").innerText.trim();
+                    let optionsText = "";
+                    const nodes = [];
+                    card.querySelectorAll(".exam-radio").forEach((block, index) => {
+                        const text = block.querySelector(".ant-col-22")?.innerText.trim() || "";
+                        optionsText += `${String.fromCharCode(65 + index)}. ${text}\n`;
+                        nodes.push(block.querySelector("input[type='radio']"));
+                    });
+                    let solved = false;
+                    for (let attempt = 0; attempt < CONFIG.MAX_RETRIES && samePaper(); attempt++) {
+                        try {
+                            const answer = await getDecisionFromAPI(title, optionsText);
+                            if (!samePaper()) continue agentLoop;
+                            const target = nodes[answer.charCodeAt(0) - 65];
+                            if (!target) throw new Error("INVALID_ANSWER");
+                            target.click();
+                            await sleep(500);
+                            solved = true;
+                            break;
+                        } catch (err) {
+                            if (!samePaper()) continue agentLoop;
+                            console.warn(`请求失败（${err}），剩余重试次数：${CONFIG.MAX_RETRIES - attempt - 1}`);
+                            if (attempt + 1 < CONFIG.MAX_RETRIES) await sleep(3000);
+                        }
+                    }
+                    if (!samePaper()) continue agentLoop;
+                    if (!solved) {
+                        skipExperiment(experiment, "达到 API 尝试上限，未提交试卷");
+                        return;
+                    }
+                }
+                if (!samePaper()) continue;
+                if (!cards.every(card => card.querySelector("input[type='radio']:checked"))) {
+                    skipExperiment(experiment, "仍有未选答案，未提交试卷");
+                    return;
+                }
+                submitBtn.click();
+                if (!await waitFor(() => !samePaper())) {
+                    skipExperiment(experiment, "提交后仍停留在答题页，请检查平台提示");
+                    return;
+                }
+                continue;
+            }
 
-            if (submitBtn) {
-                console.log("状态判定：当前处于【预考核答题页】");
-                const cards = document.querySelectorAll(".ant-card-bordered");
+            if (returnBtn) {
+                returnBtn.click();
+                await sleep(CONFIG.DELAY_MS);
+                location.reload();
+                return;
+            }
 
-                for (let card of cards) {
-                    // 仅处理真实的试题卡片
-                    if (!card.innerText.includes("试题:")) continue;
+            if (openingSince) {
+                if (Date.now() - openingSince >= CONFIG.LOAD_TIMEOUT_MS) {
+                    skipExperiment(currentExperiment, "未能进入答题页");
+                    return;
+                }
+                continue;
+            }
 
-                    // 1. 提取题干
-                    const titleNode = card.querySelector("div[style='padding: 12px;'] > div:nth-child(2)");
-                    const titleText = titleNode ? titleNode.innerText.trim() : "";
+            for (const row of document.querySelectorAll("tr.ant-table-row")) {
+                const text = row.innerText;
+                if (!isVisible(row) || text.includes("下次准考时间")
+                    || !text.includes("未通过") || !text.includes("可考试")) continue;
+                if (skippedExperiments.has(getExperiment(row).id)) continue;
+                row.click();
+                break;
+            }
+        }
+    }
 
-                    // 2. 提取选项
-                    const radioBlocks = card.querySelectorAll(".exam-radio");
-                    let optionsText = "";
-                    let targetNodes = []; // 保存点击映射目标
-
-                    radioBlocks.forEach((block, index) => {
-                        const letter = String.fromCharCode(65 + index); // 转换为 A, B, C, D
-                        const optTextNode = block.querySelector(".ant-col-22");
-                        const optText = optTextNode ? optTextNode.innerText.trim() : "";
-                        optionsText += `${letter}. ${optText}\n`;
-
-                        // 记录需要点击的原生 input 节点
-                        targetNodes.push(block.querySelector("input[type='radio']"));
-                    });
-
-                    if (titleText && optionsText) {
-                        console.log(`正在请求大模型: ${titleText.substring(0, 15)}...`);
-                        try {
-                            // 强制延时 1.5 秒，避免瞬间发出十几个请求被 Google 阻断
-                            //await sleep(1500);
-
-                            const answerLetter = await getDecisionFromAPI(titleText, optionsText);
-                            console.log(`模型决策完成: 选择 ${answerLetter}`);
-
-                            // 3. 映射并执行点击
-                            const ansIndex = answerLetter.charCodeAt(0) - 65;
-                            if (ansIndex >= 0 && ansIndex < targetNodes.length) {
-                                if (targetNodes[ansIndex]) {
-                                    targetNodes[ansIndex].click();
-                                    await sleep(500); // 严谨地预留界面 DOM 的重绘时间
-                                }
-                            }
-                        } catch (err) {
-                            console.error("单题执行中断:", err);
-                            // 结论：在此处补充如下逻辑。当某道题触发报错时，强制整个脚本在此处挂起 60000 毫秒（1 分钟），等待服务端的配额池完全重置后，再去处理下一道题。
-                            //await sleep(60000);
-                        }
-                    }
-                }
-
-                console.log("试卷作答完毕，执行提交指令");
-                submitBtn.click();
-                await sleep(CONFIG.DELAY_MS);
-                continue;
-            }
-
-            // 如果处于过渡态且存在可见的返回按钮，执行返回并刷新
-            if (returnBtn && !submitBtn) {
-                console.log("状态判定：当前处于【提交后结果页】，执行返回并硬刷新网页");
-                returnBtn.click();
-
-                // 1. 等待返回按钮的点击事件与后端交互完成
-                await sleep(CONFIG.DELAY_MS);
-
-                // 2. 触发浏览器强制刷新，同步最新考试状态
-                location.reload();
-
-                // 3. 挂起当前状态机的循环，等待浏览器彻底重载环境
-                await sleep(CONFIG.DELAY_MS * 2);
-                continue;
-            }
-
-            // 若非答题页，则判定是否处于列表页
-            console.log("状态判定：当前处于【实验项目列表页】");
-            const rows = document.querySelectorAll("tr.ant-table-row");
-            let clicked = false;
-
-            for (let row of rows) {
-                const text = row.innerText;
-                // 必须同时满足文本条件且节点可见
-                if (text.includes("未通过") && text.includes("可考试") && isVisible(row)) {
-                    console.log(`感知到考核项目，触发点击事件。`);
-                    row.click();
-                    clicked = true;
-                    await sleep(CONFIG.DELAY_MS);
-                    break; // 每次只进入一个考核
-                }
-            }
-
-            // 若当前无可考试项目，系统挂起等待
-            if (!clicked && rows.length > 0 && isVisible(rows[0])) {
-                console.log("当前列表无待考项目，轮询等待...");
-            }
-        }
-    }
-
-    // 延时挂载启动，确保前端框架渲染完毕
-    setTimeout(runAgent, 3000);
+    setTimeout(runAgent, 3000);
 })();
