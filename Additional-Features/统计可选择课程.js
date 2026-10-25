@@ -392,16 +392,21 @@
   async function waitStage(
     expected
   ) {
-    return adaptiveWait(
+    const outcome = await adaptiveWait(
       'stage',
 
       () =>
-        stage() === expected,
+        warningDialog() || stage() === expected,
 
       CONFIG.STAGE_TIMEOUT,
 
       `STAGE_${expected}`
     );
+
+    if (outcome !== true) {
+      await rejectWarning(outcome);
+    }
+    return outcome;
   }
 
   function blurEverything() {
@@ -462,6 +467,23 @@
       button =>
         text(button) === target
     ) || null;
+  }
+
+  function warningDialog() {
+    return [...document.querySelectorAll('.ant-modal')].find(modal =>
+      visible(modal) &&
+      /您已经预约过此实验项目|Requestfailedwithstatuscode502/.test(text(modal))
+    ) || null;
+  }
+
+  async function rejectWarning(modal) {
+    if (!modal) return;
+    const error = new Error(rawText(modal));
+    error.code = 'BOOKING_WARNING';
+    click(exactButton(modal, '确认') || exactButton(modal, '确定'));
+    await adaptiveWait('stage', () => !visible(modal),
+      CONFIG.STAGE_TIMEOUT, 'CLOSE_WARNING');
+    throw error;
   }
 
   // ------------------------------------------------
@@ -804,7 +826,8 @@
       .join('|');
   }
 
-  function getSeatInfo() {
+  async function getSeatInfo() {
+    await rejectWarning(warningDialog());
     const root =
       timeSection();
 
@@ -1127,9 +1150,13 @@
          * 先进入一次课程，
          * 取得日期快照。
          */
-        await enterCourse(
-          course
-        );
+        try {
+          await enterCourse(course);
+        } catch (e) {
+          if (e.code !== 'BOOKING_WARNING') throw e;
+          console.warn('[跳过实验]', course, e);
+          continue;
+        }
 
         const dates =
           getDateRows()
@@ -1195,6 +1222,9 @@
               d.date,
               e
             );
+
+            if (e.code === 'BOOKING_WARNING' &&
+                e.message.includes('已经预约过此实验项目')) break;
 
             /*
              * 尝试恢复实验列表。
